@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Project: REALITY SNI Ultimate Scanner & Validator (Zero-Footprint Edition)
+# Project: REALITY SNI Ultimate Scanner & Validator (Pro Scoring Edition)
 # Repo   : https://github.com/erickeven/job
 # Usage  : bash <(curl -sL https://raw.githubusercontent.com/erickeven/job/main/sni.sh)
 # Clean  : bash <(curl -sL https://raw.githubusercontent.com/erickeven/job/main/sni.sh) clean
@@ -33,13 +33,34 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 1. 自动获取本机公网 IP、网段、所在国家及 CPU 架构
+# 提取证书剩余有效天数函数 (双重保障: curl verbose + openssl 兜底)
+get_cert_days() {
+    local dom="$1"
+    local check_out="$2"
+    local exp_str=""
+    exp_str=$(echo "$check_out" | grep -i "expire date:" | sed 's/.*expire date: *//i' | tr -d '\r' | head -n1)
+    if [ -z "$exp_str" ] && command -v openssl >/dev/null 2>&1; then
+        exp_str=$(echo | timeout 2 openssl s_client -servername "$dom" -connect "$dom:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 | tr -d '\r')
+    fi
+    if [ -n "$exp_str" ]; then
+        local exp_ts=$(date -d "$exp_str" +%s 2>/dev/null || echo 0)
+        local now_ts=$(date +%s)
+        if [ "$exp_ts" -gt "$now_ts" ]; then
+            echo $(( (exp_ts - now_ts) / 86400 ))
+            return
+        fi
+    fi
+    echo 0
+}
+
+# 1. 自动获取本机公网 IP、网段前缀、所在国家及 CPU 架构
 IP_INFO=$(curl -s4m4 https://ipinfo.io/json 2>/dev/null || true)
 MY_IP=$(echo "$IP_INFO" | grep -oE '"ip": *"[^"]+"' | cut -d'"' -f4)
 COUNTRY=$(echo "$IP_INFO" | grep -oE '"country": *"[^"]+"' | cut -d'"' -f4)
 [ -z "$MY_IP" ] && MY_IP=$(curl -s4m4 https://api.ipify.org || curl -s4m4 https://ifconfig.me)
 [ -z "$COUNTRY" ] && COUNTRY="UNKNOWN"
-SUBNET=$(echo "$MY_IP" | awk -F. '{print $1"."$2"."$3".0/24"}')
+SUBNET_PREFIX=$(echo "$MY_IP" | awk -F. '{print $1"."$2"."$3"."}')
+SUBNET="${SUBNET_PREFIX}0/24"
 
 ARCH=$(uname -m)
 if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
@@ -48,13 +69,13 @@ else
     BIN_NAME="RealiTLScanner-linux-amd64"
 fi
 
-echo "=========================================================================="
-echo "🚀 REALITY SNI 顶级优选引擎 | IP: $MY_IP ($COUNTRY) | 网段: $SUBNET"
+echo "=========================================================================================="
+echo "🚀 REALITY SNI 顶级优选引擎 | 本机IP: $MY_IP ($COUNTRY) | 扫描网段: $SUBNET"
 echo "🛡️  运行模式: 内存沙盒零残留模式 (退出后自动粉碎一切临时文件与历史垃圾)"
-echo "=========================================================================="
+echo "=========================================================================================="
 
 # 2. 在沙盒中下载对应架构的官方扫描器
-echo "⏳ [1/3] 正在沙盒中加载 $BIN_NAME 扫描核心..."
+echo "⏳ [1/3] 正在内存沙盒中加载 $BIN_NAME 扫描核心..."
 wget -q -O "$WORK_DIR/scanner" "https://github.com/XTLS/RealiTLScanner/releases/latest/download/$BIN_NAME"
 if [ ! -s "$WORK_DIR/scanner" ]; then
     echo "❌ 下载扫描核心失败，请检查 VPS 网络连接！"
@@ -66,67 +87,91 @@ chmod +x "$WORK_DIR/scanner"
 echo "🔍 [2/3] 正在高速扫描 $SUBNET 网段内 254 个邻居 (约需 15~20 秒)..."
 "$WORK_DIR/scanner" -addr "$SUBNET" -port 443 -thread 35 -timeout 4 -out "$WORK_DIR/result.csv" >/dev/null 2>&1
 
-echo "🧪 [3/3] 正在并发执行【双国内DoH防墙校验 + 证书寿命 + H2握手测速】..."
-echo "--------------------------------------------------------------------------"
+echo "🧪 [3/3] 正在并发执行【同网段DNS验真 + 国内防墙校验 + 证书寿命 + 毫秒级延迟评分】..."
+echo "------------------------------------------------------------------------------------------"
 
 RESULT_FILE="$WORK_DIR/verified.txt"
 touch "$RESULT_FILE"
 
 if [ -s "$WORK_DIR/result.csv" ]; then
-    awk -F',' 'NR>1 {gsub(/"/, "", $6); gsub(/"/, "", $9); print $1, $5, $6, $9}' "$WORK_DIR/result.csv" | sort -u -k4,4 | while read -r ip curve cert_len domain; do
+    # 使用 | 严格分隔字段，彻底解决 "4389(certs count: 3)" 含空格导致的字段错位 Bug
+    awk -F',' 'NR>1 {
+        gsub(/"/, "", $0);
+        len = $6;
+        sub(/\(.*/, "", len);
+        print $1 "|" $5 "|" len "|" $9
+    }' "$WORK_DIR/result.csv" | sort -t'|' -u -k4,4 | while IFS='|' read -r ip curve cert_len domain; do
         (
-            # 第1关：剔除泛域名、自签证书、CDN默认证书、被偷大厂域名及 30+ 种灰产/廉价后缀
+            # 排除本机自身 IP
+            [ "$ip" == "$MY_IP" ] && exit 0
+
+            # 第1关：剔除泛域名(*)、自签证书、CDN默认证书、被偷大厂域名及灰产/廉价/政务后缀
             if [[ "$domain" =~ \*|localhost|Cloud[Ff]lare|Lucky|fastly|akamai|apple\.com|google\.com|microsoft\.com|127\.0\.0\.1|FIT2CLOUD|baota|1panel ]] || \
                [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
-               [[ "$domain" =~ \.(cn|gov|mil|edu|xyz|top|vip|lol|fun|work|sbs|mba|site|space|bond|cc|ink|navy|club|icu|ltd|online|cfd|cyou|pw|buzz|rest|monster|shop|asia|click|link|mom|party|pro|men|win|loan|bid|trade|date|review|stream|download|gdn|racing|jetzt|dpdns\.org)$ ]] || \
+               [[ "$domain" =~ \.(cn|gov|mil|edu|xyz|top|vip|lol|fun|work|sbs|mba|site|space|bond|cc|ink|navy|club|icu|ltd|online|cfd|cyou|pw|buzz|rest|monster|asia|click|link|mom|party|pro|men|win|loan|bid|trade|date|review|stream|download|gdn|racing|jetzt|dpdns\.org)$ ]] || \
                [[ "$domain" =~ \.(go|lg)\.jp$ ]] || \
                [[ "$domain" =~ ^xn-- ]]; then
                 exit 0
             fi
 
             # 证书链长度过短的直接剔除（排除伪造单证书）
-            len_num=$(echo "$cert_len" | grep -oE '^[0-9]+' || echo 0)
-            [ "$len_num" -lt 1500 ] && exit 0
+            [[ ! "$cert_len" =~ ^[0-9]+$ ]] && cert_len=2000
+            [ "$cert_len" -lt 1800 ] && exit 0
 
-            # 第2关：本机 DNS 正向核验（确保该域名真实指向该邻居 IP，排除同行假节点）
-            resolved_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')
-            [ "$resolved_ip" != "$ip" ] && exit 0
+            # 第2关：实测真实 DNS 握手连接（提取真实连接 IP、TLS 握手延迟、HTTP 状态码与证书寿命）
+            check=$(curl -I -s -v -m 4 --connect-timeout 2 --tlsv1.3 -w "\nREMOTE_IP:%{remote_ip}\nTIME_TLS:%{time_appconnect}\nHTTP_CODE:%{http_code}\n" "https://$domain" 2>&1)
 
-            # 第3关：中国大陆双 DoH (阿里 223.5.5.5 / 腾讯 1.12.12.12) 防污染与防墙核验
-            cn_dns=$(curl -s -m 2 "https://223.5.5.5/resolve?name=${domain}&type=A" 2>/dev/null || curl -s -m 2 "https://1.12.12.12/resolve?name=${domain}&type=A" 2>/dev/null || true)
-            if echo "$cn_dns" | grep -q '"Status":0'; then
-                echo "$cn_dns" | grep -q "\"$ip\"" || exit 0
-            fi
+            # 验证该域名真实 DNS 解析出的 IP 必须属于当前同一个 /24 网段（剔除同行假节点或套了 CF 的站）
+            remote_ip=$(echo "$check" | grep "^REMOTE_IP:" | cut -d: -f2 | tr -d '\r ')
+            [[ "$remote_ip" != "${SUBNET_PREFIX}"* ]] && exit 0
 
-            # 第4关：实测 TLS 1.3 + HTTP/2 + 排除各大 CDN + 校验 HTTP 状态码 + 提取证书有效期与延迟
-            check=$(curl -I -s -v -m 3 --connect-timeout 2 --tlsv1.3 -w "\nTIME_TLS:%{time_appconnect}\nHTTP_CODE:%{http_code}\n" "https://$domain" 2>&1)
-            if echo "$check" | grep -q "TLSv1.3" && echo "$check" | grep -q "HTTP/2"; then
+            # 验证 TLS 1.3 + HTTP/2 + 非大型泛播 CDN
+            if echo "$check" | grep -q "TLSv1.3" && echo "$check" | grep -qE "HTTP/2|ALPN: server accepted h2"; then
                 if ! echo "$check" | grep -qiE "server: *(cloudflare|cloudfront|akamaighost|fastly|gws|ESF)"; then
-                    # 排除 5xx 宕机状态码
-                    http_code=$(echo "$check" | grep "^HTTP_CODE:" | cut -d: -f2)
+                    # 排除 5xx 服务端错误状态码
+                    http_code=$(echo "$check" | grep "^HTTP_CODE:" | cut -d: -f2 | tr -d '\r ')
                     [[ "$http_code" =~ ^5[0-9][0-9]$ || "$http_code" == "000" ]] && exit 0
 
-                    # 计算证书剩余有效天数（剔除 < 15 天的快过期域名）
-                    exp_str=$(echo "$check" | grep -i "expire date:" | sed 's/.*expire date: *//i' | tr -d '\r' | head -n1)
-                    if [ -n "$exp_str" ]; then
-                        exp_ts=$(date -d "$exp_str" +%s 2>/dev/null || echo 0)
-                        now_ts=$(date +%s)
-                        days_left=$(( (exp_ts - now_ts) / 86400 ))
-                        [ "$days_left" -lt 15 ] && exit 0
-                    else
-                        days_left=60
+                    # 第3关：中国大陆 DoH (223.5.5.5) 防污染校验 (若国内解析被污染成其他网段则剔除)
+                    cn_dns=$(curl -s -m 2 "https://223.5.5.5/resolve?name=${domain}&type=A" 2>/dev/null || true)
+                    if echo "$cn_dns" | grep -q '"Status":0' && echo "$cn_dns" | grep -q '"data"'; then
+                        echo "$cn_dns" | grep -q "$SUBNET_PREFIX" || exit 0
                     fi
 
+                    # 第4关：计算证书剩余天数（剔除 < 15 天的快过期域名）
+                    days_left=$(get_cert_days "$domain" "$check")
+                    [ "$days_left" -lt 15 ] && exit 0
+
                     # 计算 TLS 握手耗时 (毫秒)
-                    tls_sec=$(echo "$check" | grep "^TIME_TLS:" | cut -d: -f2)
+                    tls_sec=$(echo "$check" | grep "^TIME_TLS:" | cut -d: -f2 | tr -d '\r ')
                     tls_ms=$(awk -v t="$tls_sec" 'BEGIN { printf "%d", (t * 1000) }')
                     [ "$tls_ms" -le 0 ] && tls_ms=1
 
-                    if [ "$curve" = "X25519MLKEM768" ]; then
-                        echo "1|$tls_ms|$days_left|$domain|$ip|$curve|🌟 抗量子首选" >> "$RESULT_FILE"
+                    # 第5关：计算 100 分制抗封综合评分
+                    score=50 # 同网段真邻居基础分 50 (ASN与IP段100%吻合)
+                    if [ "$curve" == "X25519MLKEM768" ]; then
+                        score=$((score + 20))
+                        label="🌟 抗量子同网段"
                     else
-                        echo "2|$tls_ms|$days_left|$domain|$ip|$curve|✅ 标准合格" >> "$RESULT_FILE"
+                        score=$((score + 10))
+                        label="✅ 标准同网段"
                     fi
+
+                    if [ "$tls_ms" -le 5 ]; then
+                        score=$((score + 20))
+                    elif [ "$tls_ms" -le 15 ]; then
+                        score=$((score + 15))
+                    elif [ "$tls_ms" -le 30 ]; then
+                        score=$((score + 10))
+                    fi
+
+                    if [ "$days_left" -ge 45 ] && [ "$cert_len" -ge 3000 ]; then
+                        score=$((score + 10))
+                    elif [ "$days_left" -ge 25 ]; then
+                        score=$((score + 5))
+                    fi
+
+                    echo "$score|$tls_ms|$days_left|$domain|$remote_ip|$curve|$label" >> "$RESULT_FILE"
                 fi
             fi
         ) &
@@ -134,43 +179,47 @@ if [ -s "$WORK_DIR/result.csv" ]; then
     wait
 fi
 
-# 4. 输出同网段优选结果或按国家自动匹配大站保底池
-if [ -s "$RESULT_FILE" ]; then
-    printf "%-16s | %-28s | %-15s | %-8s | %-10s | %s\n" "推荐等级" "可直接使用的 SNI 域名" "同网段邻居IP" "握手延迟" "证书有效期" "密钥交换曲线"
-    echo "--------------------------------------------------------------------------"
-    sort -t'|' -k1,1n -k2,2n -k3,3nr "$RESULT_FILE" | while IFS='|' read -r tier ms days dom dip dcurve label; do
-        printf "%-18s | %-28s | %-15s | %-6s | %-8s | %s\n" "$label" "$dom" "$dip" "${ms}ms" "剩${days}天" "$dcurve"
-    done
-    BEST_DOM=$(sort -t'|' -k1,1n -k2,2n -k3,3nr "$RESULT_FILE" | head -n1 | cut -d'|' -f4)
-else
-    echo "⚠️ 当前 $SUBNET 网段内无满足严苛标准的邻居，已根据本机地区 ($COUNTRY) 启动大牌白名单测速..."
-    case "$COUNTRY" in
-        JP) POOL="www.iij.ad.jp www.sakura.ad.jp ftp.jaist.ac.jp www.nic.ad.jp addons.mozilla.org" ;;
-        HK|TW|MO) POOL="ftp.cuhk.edu.hk www.hkix.net addons.mozilla.org swdist.apple.com dl.fedoraproject.org" ;;
-        SG|KR|MY) POOL="addons.mozilla.org swdist.apple.com dl.fedoraproject.org aus5.mozilla.org" ;;
-        DE|NL|FR|GB| EU) POOL="www.tu-berlin.de addons.mozilla.org dl.fedoraproject.org aus5.mozilla.org" ;;
-        *) POOL="dl.fedoraproject.org addons.mozilla.org swdist.apple.com mirrors.mit.edu mirrors.ocf.berkeley.edu" ;;
-    esac
-
+# 4. 如果同网段邻居为空，启动同地区低延迟 (<35ms) 白名单测速，同样完整显示证书寿命与曲线
+if [ ! -s "$RESULT_FILE" ]; then
+    echo "⚠️ 当前 $SUBNET 网段内无合格建站邻居，正在测速本地区 ($COUNTRY) 低延迟高信誉大站..."
+    POOL="www.iij.ad.jp www.sakura.ad.jp ftp.jaist.ac.jp www.nic.ad.jp www.tu-berlin.de dl.fedoraproject.org addons.mozilla.org swdist.apple.com mirrors.mit.edu"
     for bdom in $POOL; do
         (
-            check=$(curl -I -s -v -m 3 --connect-timeout 2 --tlsv1.3 -w "\nTIME_TLS:%{time_appconnect}\n" "https://$bdom" 2>&1)
-            if echo "$check" | grep -q "TLSv1.3" && echo "$check" | grep -q "HTTP/2"; then
-                tls_sec=$(echo "$check" | grep "^TIME_TLS:" | cut -d: -f2)
+            check=$(curl -I -s -v -m 4 --connect-timeout 2 --tlsv1.3 -w "\nREMOTE_IP:%{remote_ip}\nTIME_TLS:%{time_appconnect}\n" "https://$bdom" 2>&1)
+            if echo "$check" | grep -q "TLSv1.3" && echo "$check" | grep -qE "HTTP/2|ALPN: server accepted h2"; then
+                remote_ip=$(echo "$check" | grep "^REMOTE_IP:" | cut -d: -f2 | tr -d '\r ')
+                tls_sec=$(echo "$check" | grep "^TIME_TLS:" | cut -d: -f2 | tr -d '\r ')
                 tls_ms=$(awk -v t="$tls_sec" 'BEGIN { printf "%d", (t * 1000) }')
                 [ "$tls_ms" -le 0 ] && tls_ms=1
-                echo "$tls_ms|$bdom" >> "$RESULT_FILE"
+                days_left=$(get_cert_days "$bdom" "$check")
+                [ "$days_left" -le 0 ] && days_left=60
+                curve="X25519"
+                echo "$check" | grep -qi "MLKEM768" && curve="X25519MLKEM768"
+                score=$(( 60 - (tls_ms / 3) ))
+                [ "$score" -lt 10 ] && score=10
+                echo "$score|$tls_ms|$days_left|$bdom|$remote_ip|$curve|🛡️ 地区保底大站" >> "$RESULT_FILE"
             fi
         ) &
     done
     wait
-    sort -t'|' -k1,1n "$RESULT_FILE" | while IFS='|' read -r ms bdom; do
-        echo "✅ [地区优选大站] 域名: $(printf '%-25s' "$bdom") (本机握手延迟: ${ms}ms)"
-    done
-    BEST_DOM=$(sort -t'|' -k1,1n "$RESULT_FILE" | head -n1 | cut -d'|' -f2)
 fi
 
-# 5. 自动生成当前节点专属的 X25519 公私钥对与 ShortId (方便在 V2board 中一键复制)
+# 5. 打印完整排行榜表格
+printf "%-18s | %-8s | %-26s | %-15s | %-8s | %-10s | %s\n" "推荐等级" "抗封评分" "可直接使用的 SNI 域名" "目标IP地址" "握手延迟" "证书有效期" "密钥交换曲线"
+echo "------------------------------------------------------------------------------------------"
+sort -t'|' -k1,1nr -k2,2n -k3,3nr "$RESULT_FILE" | while IFS='|' read -r score ms days dom dip dcurve label; do
+    printf "%-20s | %-8s | %-26s | %-15s | %-6s | %-8s | %s\n" "$label" "${score}分" "$dom" "$dip" "${ms}ms" "剩${days}天" "$dcurve"
+done
+
+BEST_LINE=$(sort -t'|' -k1,1nr -k2,2n -k3,3nr "$RESULT_FILE" | head -n1)
+BEST_SCORE=$(echo "$BEST_LINE" | cut -d'|' -f1)
+BEST_MS=$(echo "$BEST_LINE" | cut -d'|' -f2)
+BEST_DAYS=$(echo "$BEST_LINE" | cut -d'|' -f3)
+BEST_DOM=$(echo "$BEST_LINE" | cut -d'|' -f4)
+BEST_IP=$(echo "$BEST_LINE" | cut -d'|' -f5)
+BEST_CURVE=$(echo "$BEST_LINE" | cut -d'|' -f6)
+
+# 6. 自动生成当前节点专属的 X25519 公私钥对与 ShortId
 PRIV_KEY=""
 PUB_KEY=""
 if command -v openssl >/dev/null 2>&1; then
@@ -182,15 +231,15 @@ if command -v openssl >/dev/null 2>&1; then
 fi
 SHORT_ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 
-echo "=========================================================================="
-echo "🏆 【V2board 节点安全性配置 — 一键复制套件】"
-echo "--------------------------------------------------------------------------"
-echo "  • Server Name(SNI) : $BEST_DOM"
+echo "=========================================================================================="
+echo "🏆 【V2board 节点安全性配置 — 冠军推荐一键复制套件】"
+echo "------------------------------------------------------------------------------------------"
+echo "  • Server Name(SNI) : $BEST_DOM   (抗封评分: ${BEST_SCORE}分 | 握手延迟: ${BEST_MS}ms | 证书剩余: ${BEST_DAYS}天 | 曲线: $BEST_CURVE)"
 echo "  • Server Port      : 443"
 if [ -n "$PRIV_KEY" ] && [ -n "$PUB_KEY" ]; then
     echo "  • Private Key      : $PRIV_KEY"
     echo "  • Public Key       : $PUB_KEY"
 fi
 echo "  • ShortId          : $SHORT_ID"
-echo "=========================================================================="
+echo "=========================================================================================="
 echo "🧹 沙盒自毁与历史垃圾清理已完成，当前 VPS 零文件残留！"
